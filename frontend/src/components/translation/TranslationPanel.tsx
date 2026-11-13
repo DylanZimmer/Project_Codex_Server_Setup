@@ -1,6 +1,7 @@
 import React from 'react'
 import { useTranslation } from 'react-i18next'
 import { Button, Select, Alert } from '../ui'
+import { SuggestNameForm } from './SuggestNameForm'
 import type { SearchResultRow, LanguageOption, CountryOption } from '../../types/codex'
 
 interface TranslationPanelProps {
@@ -140,6 +141,16 @@ export const TranslationPanel: React.FC<TranslationPanelProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* Anyone at the box can propose a better name; it goes to the server's review queue. */}
+      {(translatedName || translateError) && !isTranslating && targetLanguage && (
+        <SuggestNameForm
+          key={`${selectedResult.name}|${targetLanguage}|${targetCountry}`}
+          canonical={selectedResult.name}
+          language={targetLanguage}
+          country={targetCountry}
+        />
       )}
     </div>
   )

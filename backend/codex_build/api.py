@@ -14,15 +14,23 @@ Endpoints
   GET  /health              Liveness check — API + Neo4j
   POST /translate           Translate a drug term
   GET  /audit/{term}        Quality audit (missing translations / brands)
-  POST /demo/load           Load built-in sample data
-  POST /packs/load          Upload and load a language pack JSON
+  POST /packs/load          Upload and load a pack file (server pack, or an old-style language pack)
   GET  /languages           List language codes that have data in Neo4j
+  GET  /sync/status         Connection to the Codex server, assignment, installed packs
+  POST /sync/run            Sync with the Codex server now
+  PUT  /sync/assignment     Set this box's country and languages
+  GET  /suggestions         Translator suggestions from this box and their review status
+  POST /suggestions         Queue a translator suggestion (sent at the next sync)
+
+Drug data comes from the Codex server (gb_server) as packs. Importing sources (DrugBank, RxNorm, ...)
+happens on the server, not here.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import json
 import tempfile
 import logging
 from typing import Any, Dict, List, Optional
@@ -36,7 +44,6 @@ import ast
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from neo4j_sources.source_data import source_data
 from ocr.ocrmatching import router as ocr_router
 
 
@@ -64,6 +71,8 @@ try:
         get_countries_for_brand,
         get_languages_for_brand,
     )
+    from codex.services import packs as pack_store
+    from codex.services import sync
 except Exception as exc:
     logging.critical("Failed to import codex backend: %s", exc)
     raise exc
@@ -74,7 +83,8 @@ log = logging.getLogger("codex.api")
 
 BASE_DIR = Path(__file__).resolve().parent
 DEMO_PACKS_DIR = BASE_DIR / "demo_language_packs"
-LOAD_DEMO_DATA = os.getenv("LOAD_DEMO_DATA", "true").lower() in ("true", "1", "yes")
+# Off by default: data now comes from the Codex server. Turn on for a demo without a server.
+LOAD_DEMO_DATA = os.getenv("LOAD_DEMO_DATA", "false").lower() in ("true", "1", "yes")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -87,7 +97,15 @@ async def lifespan(app: FastAPI):
     else:
         log.info("LOAD_DEMO_DATA is false; skipping automatic demo pack loading.")
 
-    yield 
+    # Use the fallback language chains from the installed core pack, then keep in sync with the Codex server
+    # in the background (does nothing until CODEX_SERVER_URL / CODEX_INSTANCE_KEY are set).
+    try:
+        pack_store.restore_fallbacks()
+    except Exception as exc:
+        log.warning("Could not read fallback chains from the core pack: %s", exc)
+    sync.start()
+    yield
+    sync.stop()
 
 app = FastAPI(
     title="Codex Medical Translation API",
@@ -117,31 +135,6 @@ app.add_middleware(
 )
 
 app.include_router(ocr_router)
-
-class SourceSelection(BaseModel):
-    selectedSources: List[str]
-    DBAPIKey: str
-    ICDID: str
-    ICDSecret: str
-
-@app.post(
-    "/api/populate-sources",
-    tags=["data"]
-)
-async def handle_populate(data: SourceSelection):
-    sources = data.selectedSources
-    drugbankAPIKey = data.DBAPIKey
-    icdID = data.ICDID
-    icdSecret= data.ICDSecret
-    return StreamingResponse(
-        source_data(sources, drugbankAPIKey, icdID, icdSecret),
-        media_type="application/x-ndjson",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no", 
-            "Connection": "keep-alive",
-        }
-    )
 
 # ── Request / response models ────────────────────────────────────────────────
 
@@ -452,15 +445,29 @@ async def load_pack(file: UploadFile = File(...)):
 
     log.info("Loading language pack: %s", file.filename)
 
-    # Write to a temp file so load_language_pack() (which expects a path) works
+    # A pack file from the Codex server (brought in by hand, e.g. on a USB stick) has a manifest:
+    # install it like a synced pack, so its version is recorded and it can be removed later.
     try:
         content = await file.read()
+        try:
+            parsed = json.loads(content.decode("utf-8"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="The file is not valid JSON")
+        installed_pack = pack_store.install_file(parsed)
+        if installed_pack:
+            return MessageResponse(message=f"Installed {installed_pack['id']} version {installed_pack['version']}")
+
+        # Old-style language pack without a manifest: load it the original way.
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
             tmp.write(content)
             tmp_path = tmp.name
 
         message = load_language_pack(tmp_path)
         return MessageResponse(message=message)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         log.exception("load_pack failed")
         raise HTTPException(status_code=500, detail=str(exc))
@@ -503,6 +510,62 @@ def list_languages():
     except Exception as exc:
         log.exception("list_languages failed")
         raise HTTPException(status_code=500, detail=str(exc))
+
+# ── Sync with the Codex server ───────────────────────────────────────────────
+
+class AssignmentRequest(BaseModel):
+    country: str
+    languages: List[str]
+
+
+class SuggestionRequest(BaseModel):
+    canonical: str
+    language: str
+    text: str
+    country: Optional[str] = None
+    type: str = "generic"
+    note: Optional[str] = None
+    submitted_by: Optional[str] = None
+
+
+@app.get("/sync/status", summary="Connection to the Codex server and installed packs", tags=["sync"])
+def sync_status():
+    return sync.status()
+
+
+@app.post("/sync/run", summary="Sync with the Codex server now", tags=["sync"])
+def sync_run():
+    # FastAPI runs plain (non-async) handlers in a worker thread, so this does not block other requests.
+    return sync.sync_now("manual")
+
+
+@app.put("/sync/assignment", summary="Set this box's country and languages", tags=["sync"])
+def sync_assignment(body: AssignmentRequest):
+    try:
+        assignment = sync.set_assignment(body.country, body.languages)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if sync.configured():
+        sync.run_in_background("assignment")
+    return {"assignment": assignment}
+
+
+@app.get("/suggestions", summary="Translator suggestions from this box", tags=["sync"])
+def suggestions_list():
+    return {"suggestions": sync.list_suggestions()}
+
+
+@app.post("/suggestions", status_code=status.HTTP_201_CREATED, summary="Suggest a better name", tags=["sync"])
+def suggestions_add(body: SuggestionRequest):
+    try:
+        item = sync.add_suggestion(body.canonical, body.language, body.text, country=body.country,
+                                   term_type=body.type, note=body.note, submitted_by=body.submitted_by)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if sync.configured():
+        sync.run_in_background("suggestion")
+    return {"suggestion": item}
+
 
 # ── Entry point (for running directly) ──────────────────────────────────────
 if __name__ == "__main__":

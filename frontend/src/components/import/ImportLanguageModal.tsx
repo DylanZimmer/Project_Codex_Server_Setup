@@ -1,8 +1,7 @@
 import React, { useState, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Modal, Button, Alert } from '../ui'
-
-const API_BASE_URL = 'http://localhost:8000'
+import { API_BASE_URL } from '../../services/api'
 
 interface ImportLanguageModalProps {
   onImportSuccess?: () => void
@@ -41,8 +40,11 @@ export const ImportLanguageModal: React.FC<ImportLanguageModalProps> = ({
         throw new Error('El JSON debe ser un objeto válido.')
       }
 
-      if (!json.language || !json.language.code || !Array.isArray(json.terms)) {
-        throw new Error("El archivo no tiene el formato de Language Pack (debe incluir 'language.code' y la lista 'terms').")
+      // Accepted: a pack file from the Codex server (it has a manifest), or an old-style language pack.
+      const isServerPack = Boolean(json.manifest && typeof json.manifest.id === 'string')
+      const isLanguagePack = Boolean(json.language && json.language.code && Array.isArray(json.terms))
+      if (!isServerPack && !isLanguagePack) {
+        throw new Error("This is not a pack file: expected a pack from the Codex server, or a language pack with 'language.code' and 'terms'.")
       }
 
       setSelectedFile(file)
@@ -148,7 +150,7 @@ export const ImportLanguageModal: React.FC<ImportLanguageModalProps> = ({
         isOpen={isOpen}
         onClose={resetAndClose}
         title={t('home.importTitle') || 'Import Language Pack'}
-        subtitle="Upload a standardized .json language pack to Neo4j"
+        subtitle="For boxes without internet: load a pack file copied from the Codex server"
         icon="📁"
       >
         <form onSubmit={handleUpload} className="space-y-4">

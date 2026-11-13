@@ -20,9 +20,41 @@ docker compose up --build
 
 Wait ~30 seconds for Neo4j, API, and Frontend to be ready.
 
-- **Frontend UI:** [http://localhost:9000](http://localhost:9000) (or ports 9000-9010)
+- **Frontend UI:** [http://localhost:9000](http://localhost:9000)
 - **API Docs (Swagger):** [http://localhost:8000/docs](http://localhost:8000/docs)
 - **Neo4j Browser:** [http://localhost:7474](http://localhost:7474) (login: `neo4j` / `changeme`)
+
+---
+
+## Connecting to the Codex server
+
+Codex boxes get their drug data from the Codex server (`gb_server/`) as **packs**:
+- one **core** pack
+- one pack per **language** (translated names)
+- one pack per **country** (local brand names)
+
+Each box downloads only the packs for where it's used. Importing the sources (DrugBank, RxNorm, ICD-11, SNOMED) happens on the server, not here.
+
+1. On the server's admin page (`/admin/`), go to **Instances → Add instance**. It shows this box's key once.
+2. In this project's `.env`, set:
+   ```
+   CODEX_SERVER_URL=https://<server address>        # same machine in Docker: http://host.docker.internal:3000
+   CODEX_INSTANCE_KEY=<the key>
+   CODEX_COUNTRY=UA
+   CODEX_LANGUAGES=uk
+   ```
+3. Restart the API. It syncs at startup and then every `CODEX_SYNC_INTERVAL_MINUTES` (default 6 hours) whenever the server can be reached. Without a connection, the box keeps working with the packs it already has.
+
+The **Sync** button in the app shows:
+- the connection and the last successful sync
+- the installed packs
+- where the box is used. Changing the country or languages there installs the matching packs and removes the rest at the next sync.
+
+**Translator suggestions:** under a translation result, "Suggest a better name" queues a proposal. It goes to the server at the next sync. A reviewer there approves or rejects it, and approved names reach every box with the next pack version. The Sync screen shows each suggestion's status.
+
+**Boxes without internet:** download the pack files on a connected machine, using the Codex-format link of each pack (`?format=codex`). Then load them here with **Import Language** (or `POST /packs/load`). They're installed exactly like synced packs, with their versions recorded.
+
+How packs are stored: everything a pack creates in Neo4j is tagged with the pack's id. Removing a pack deletes only what no other installed pack, and nothing loaded by hand, still uses. The code is in `backend/codex_build/codex/services/packs.py` (loading and removal) and `sync.py` (talking to the server).
 
 ---
 
@@ -58,11 +90,11 @@ docker compose logs -f neo4j
 cp .env.example .env
 ```
 
-The defaults match `docker-compose.yml` exactly. Edit `.env` only if you have changed credentials or API keys (DrugBank, ICD-11).
+The defaults match `docker-compose.yml` exactly. Fill in the `CODEX_*` settings to connect to the Codex server (see [Connecting to the Codex server](#connecting-to-the-codex-server)).
 
 #### Demo Language Packs
 
-By default, the API automatically preloads sample language packs from `backend/codex_build/demo_language_packs/` on startup (`LOAD_DEMO_DATA=true`). To start with an empty database (for testing clean manual pack ingestion via UI or CLI), set `LOAD_DEMO_DATA=false` in `.env`.
+To try Codex without a server, set `LOAD_DEMO_DATA=true` in `.env`. The API then loads the sample packs from `backend/codex_build/demo_language_packs/` at startup. It's off by default, because data normally comes from the server.
 
 ---
 
@@ -110,19 +142,16 @@ Expected output:
 
 ### Step 6 — Load drug data
 
-Upload CSV files per language/country combination:
+With the `CODEX_*` settings filled in, the data arrives from the Codex server on the first sync. Use the **Sync** button in the app, or:
 
 ```bash
-codex> csv upload sample_data/drugs_en_US.csv
-codex> csv upload sample_data/drugs_es_MX.csv
+curl -X POST http://localhost:8000/sync/run
 ```
 
-Verify what was loaded:
+Without a server, load a pack file by hand: from the app's **Import Language** button, or `codex> load path/to/pack.json` in the CLI. Then check what's there:
 
 ```bash
-codex> languages          # shows: en, es
-codex> countries          # shows: MX (Spanish), US (English)
-codex> csv list           # full catalogue sorted alphabetically
+codex> languages
 ```
 
 ---
@@ -200,11 +229,15 @@ All API responses returning tabular data use this envelope:
 | GET    | `/health`       | Liveness check — API + Neo4j                               |
 | POST   | `/translate`    | Translate a drug name between languages                    |
 | GET    | `/audit/{term}` | Quality audit (missing translations / brands)              |
-| GET    | `/languages`    | List language codes loaded in Neo4j                        |
-| GET    | `/countries`    | List supported countries and their languages               |
-| POST   | `/csv/upload`   | Upload a Codex CSV → Neo4j                                 |
-| GET    | `/csv`          | Export full drug catalogue (sorted)                        |
+| POST   | `/search`       | Find drugs and brands by name (fuzzy)                      |
+| GET    | `/languages`    | List language codes (and their countries) loaded in Neo4j  |
+| POST   | `/packs/load`   | Load a pack file by hand (server pack or old-style pack)   |
 | POST   | `/ocrmatching/` | Extract text from image via OCR and fuzzy match drug terms |
+| GET    | `/sync/status`  | Server connection, assignment, installed packs, last sync  |
+| POST   | `/sync/run`     | Sync with the Codex server now                             |
+| PUT    | `/sync/assignment` | Set this box's country and languages                    |
+| GET    | `/suggestions`  | Translator suggestions from this box and their status      |
+| POST   | `/suggestions`  | Queue a suggestion for review (sent at the next sync)      |
 
 
 ### POST /translate — request body

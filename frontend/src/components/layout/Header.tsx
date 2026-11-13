@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
-import { PopulateDropdown } from '../populate/PopulateDropdown'
+import { SyncModal } from '../sync/SyncModal'
 import { ImportLanguageModal } from '../import/ImportLanguageModal'
 import { LanguageSelector } from '../language/LanguageSelector'
 import { LanguageFilterModal } from '../language/LanguageFilterModal'
@@ -84,7 +84,7 @@ export const Header: React.FC<HeaderProps> = ({
 
           {/* Desktop Controls (md: and up) */}
           <div className="hidden md:flex items-center gap-3">
-            <PopulateDropdown />
+            <SyncModal onSyncComplete={onImportSuccess} />
             <ImportLanguageModal onImportSuccess={onImportSuccess} />
             {onSelectTerm && (
               <OcrModal
@@ -209,7 +209,7 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
             <div className="flex flex-col gap-4">
               <div className="w-full">
-                <PopulateDropdown fullWidth />
+                <SyncModal fullWidth onSyncComplete={onImportSuccess} />
               </div>
               <div className="w-full">
                 <ImportLanguageModal
